@@ -25,6 +25,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install opencv-python-headless scikit-image imagehash pillow pandas pydrive2 requests
 
+      # 1) Pull screenshots from Google Drive (Shared Drive) to local workspace
       - name: Pull screenshots from Drive (Shared Drive)
         env:
           GDRIVE_SERVICE_ACCOUNT_JSON: ${{ secrets.GDRIVE_SERVICE_ACCOUNT_JSON }}
@@ -40,6 +41,7 @@ jobs:
           print("✅ Downloaded screenshots into data/screenshots")
           PY
 
+      # 2) Compare last-two images per folder; copy both originals + make heatmaps/CSV/HTML
       - name: Compare latest pairs
         env:
           INPUT_LOCAL_ROOT: data/screenshots
@@ -49,6 +51,7 @@ jobs:
         run: |
           python tools/compare_latest_pair.py
 
+      # 3) Upload the new run_... folder back to Drive and make it shareable
       - name: Upload run folder to Drive & expose share link
         id: upload
         env:
@@ -72,24 +75,22 @@ jobs:
             fh.write(f"link={link}\n")
           PY
 
+      # 4) (Optional) Post digest to ClickUp Chat channel when secrets are present
       - name: Post to ClickUp channel (optional)
-        if: ${{ secrets.CLICKUP_TOKEN && secrets.CLICKUP_WORKSPACE_ID && secrets.CLICKUP_CHANNEL_ID }}
         env:
           CLICKUP_TOKEN: ${{ secrets.CLICKUP_TOKEN }}
           CLICKUP_WORKSPACE_ID: ${{ secrets.CLICKUP_WORKSPACE_ID }}
           CLICKUP_CHANNEL_ID: ${{ secrets.CLICKUP_CHANNEL_ID }}
+        if: ${{ env.CLICKUP_TOKEN != '' && env.CLICKUP_WORKSPACE_ID != '' && env.CLICKUP_CHANNEL_ID != '' }}
         run: |
           python - << 'PY'
-          import os, pandas as pd
+          import os, pandas as pd, requests
           from pathlib import Path
-          import requests
 
-          # Locate latest run and CSV
           runs = sorted([p for p in Path("out/diffs").glob("run_*") if p.is_dir()])
           latest = runs[-1]
           csv_path = latest / "summary.csv"
 
-          # Build human message (action-only)
           df = pd.read_csv(csv_path)
           changed = df[df["changed"] == True].copy()
           title_time = latest.name.replace("run_", "").replace("_", " ")
@@ -103,24 +104,19 @@ jobs:
           else:
             lines.append("No UI/UX changes detected across monitored pages.")
 
-          # Add Drive link for the run folder (includes heatmaps + BOTH source images)
           link = "${{ steps.upload.outputs.link }}"
           lines.append("\nFull report, heatmaps, and both source images in:")
           lines.append(link)
 
           message = "\n".join(lines)
 
-          # Send to ClickUp Chat channel
-          token = os.environ["CLICKUP_TOKEN"]
-          ws_id = os.environ["CLICKUP_WORKSPACE_ID"]
-          ch_id = os.environ["CLICKUP_CHANNEL_ID"]
-          url = f"https://api.clickup-stg.com/api/v3/workspaces/{ws_id}/chat/channels/{ch_id}/messages"
-          headers = {"Authorization": token, "Content-Type": "application/json"}
-          payload = {"text": message}
-          r = requests.post(url, headers=headers, json=payload, timeout=30)
+          url = f"https://api.clickup-stg.com/api/v3/workspaces/{os.environ['CLICKUP_WORKSPACE_ID']}/chat/channels/{os.environ['CLICKUP_CHANNEL_ID']}/messages"
+          headers = {"Authorization": os.environ["CLICKUP_TOKEN"], "Content-Type": "application/json"}
+          r = requests.post(url, headers=headers, json={"text": message}, timeout=30)
           print("ClickUp response:", r.status_code, r.text[:400])
           PY
 
+      # 5) Keep a copy of the run as an artifact (handy for debugging)
       - name: Upload run as GitHub artifact (optional)
         uses: actions/upload-artifact@v4
         with:
