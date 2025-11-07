@@ -1,0 +1,124 @@
+name: UI Monitor (daily)
+
+on:
+  schedule:
+    - cron: "0 7 * * *"     # ~10:30 IST daily
+  workflow_dispatch:
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          pip install opencv-python-headless scikit-image imagehash pillow pandas pydrive2 requests
+
+      - name: Pull screenshots from Drive (Shared Drive)
+        env:
+          GDRIVE_SERVICE_ACCOUNT_JSON: ${{ secrets.GDRIVE_SERVICE_ACCOUNT_JSON }}
+          INPUT_DRIVE_FOLDER_ID: ${{ secrets.INPUT_DRIVE_FOLDER_ID }}
+        run: |
+          python - << 'PY'
+          import os
+          from tools.drive_sync import drive_client_from_service_account_json, download_folder_tree
+          sa = os.environ["GDRIVE_SERVICE_ACCOUNT_JSON"]
+          root_id = os.environ["INPUT_DRIVE_FOLDER_ID"]
+          drive = drive_client_from_service_account_json(sa)
+          download_folder_tree(drive, root_id, "data/screenshots")
+          print("✅ Downloaded screenshots into data/screenshots")
+          PY
+
+      - name: Compare latest pairs
+        env:
+          INPUT_LOCAL_ROOT: data/screenshots
+          REPORT_LOCAL_ROOT: out/diffs
+          SSIM_THRESHOLD: "0.985"
+          PHASH_THRESHOLD: "8"
+        run: |
+          python tools/compare_latest_pair.py
+
+      - name: Upload run folder to Drive & print share link
+        id: upload
+        env:
+          GDRIVE_SERVICE_ACCOUNT_JSON: ${{ secrets.GDRIVE_SERVICE_ACCOUNT_JSON }}
+          REPORTS_PARENT_FOLDER_ID: ${{ secrets.REPORTS_PARENT_FOLDER_ID }}
+        run: |
+          python - << 'PY'
+          import os, glob
+          from pathlib import Path
+          from tools.drive_sync import drive_client_from_service_account_json, upload_run_folder
+          sa = os.environ["GDRIVE_SERVICE_ACCOUNT_JSON"]
+          pid = os.environ["REPORTS_PARENT_FOLDER_ID"]
+          drive = drive_client_from_service_account_json(sa)
+          runs = sorted([p for p in Path("out/diffs").glob("run_*") if p.is_dir()])
+          assert runs, "No run folder found in out/diffs"
+          latest = runs[-1]
+          link = upload_run_folder(drive, pid, latest.as_posix())
+          print("RUN_LINK::", link)   # we’ll grab this in the next step
+          # also save to GITHUB_OUTPUT
+          print(f"link={link}", file=open(os.environ["GITHUB_OUTPUT"], "a"))
+          PY
+
+      # (Optional, later) Send message to ClickUp channel if secrets are set
+      - name: Post to ClickUp channel (optional)
+        if: ${{ secrets.CLICKUP_TOKEN != '' && secrets.CLICKUP_WORKSPACE_ID != '' && secrets.CLICKUP_CHANNEL_ID != '' }}
+        env:
+          CLICKUP_TOKEN: ${{ secrets.CLICKUP_TOKEN }}
+          CLICKUP_WORKSPACE_ID: ${{ secrets.CLICKUP_WORKSPACE_ID }}
+          CLICKUP_CHANNEL_ID: ${{ secrets.CLICKUP_CHANNEL_ID }}
+        run: |
+          python - << 'PY'
+          import os, pandas as pd
+          from pathlib import Path
+          import requests
+
+          # Locate latest run folder + CSV
+          runs = sorted([p for p in Path("out/diffs").glob("run_*") if p.is_dir()])
+          latest = runs[-1]
+          csv_path = latest / "summary.csv"
+
+          # Build message
+          df = pd.read_csv(csv_path)
+          changed = df[df["changed"] == True].copy()
+          title_time = latest.name.replace("run_", "").replace("_", " ")
+          lines = [f"Daily UI review — {title_time}"]
+
+          if len(changed):
+            lines.append("Changes detected:")
+            for _, r in changed.iterrows():
+              zone = f" Likely area: {r['likely_zone']}." if isinstance(r['likely_zone'], str) and r['likely_zone'] else ""
+              lines.append(f"• UI/UX of {r['page']} has been changed compared to the previous capture.{zone}")
+          else:
+            lines.append("No UI/UX changes detected across monitored pages.")
+
+          # Add Drive link for the run folder
+          link = "${{ steps.upload.outputs.link }}"
+          lines.append("\nFull report, heatmaps, and both source images in:")
+          lines.append(link)
+
+          message = "\n".join(lines)
+
+          # Send to ClickUp Chat channel
+          token = os.environ["CLICKUP_TOKEN"]
+          ws_id = os.environ["CLICKUP_WORKSPACE_ID"]
+          ch_id = os.environ["CLICKUP_CHANNEL_ID"]
+
+          url = f"https://api.clickup-stg.com/api/v3/workspaces/{ws_id}/chat/channels/{ch_id}/messages"
+          headers = {"Authorization": token, "Content-Type": "application/json"}
+          payload = {"text": message}
+          r = requests.post(url, headers=headers, json=payload, timeout=30)
+          print("ClickUp response:", r.status_code, r.text[:500])
+          PY
+
+      - name: Store artifacts (optional)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ui-diff-run
+          path: out/diffs/**
