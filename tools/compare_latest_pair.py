@@ -1,5 +1,4 @@
-# tools/compare_latest_pair.py
-import os, glob, cv2, json, shutil
+import os, glob, cv2, shutil, re
 from pathlib import Path
 from datetime import datetime
 import numpy as np
@@ -16,22 +15,59 @@ REPORT_LOCAL_ROOT = os.environ.get("REPORT_LOCAL_ROOT", "out/diffs")
 RUN_STAMP = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 OUTDIR = Path(REPORT_LOCAL_ROOT) / f"run_{RUN_STAMP}"
 
-TS_FORMATS = ("%Y-%m-%d_%H-%M-%S","%Y%m%d-%H%M%S","%Y%m%d_%H%M%S","%Y-%m-%d %H.%M.%S")
+# Common filename timestamp formats
+TS_FORMATS = (
+    "%Y-%m-%d_%H-%M-%S",
+    "%Y-%m-%d %H.%M.%S",
+    "%Y%m%d-%H%M%S",
+    "%Y%m%d_%H%M%S",
+    "%Y%m%d%H%M%S",
+)
 
 def ensure_dir(p: Path): p.mkdir(parents=True, exist_ok=True)
-def to_gray(img): return img if img.ndim == 2 else cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+def to_gray(img): 
+    return img if img.ndim == 2 else cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
 def resize_to_min(a, b):
     h = min(a.shape[0], b.shape[0]); w = min(a.shape[1], b.shape[1])
     return cv2.resize(a, (w, h)), cv2.resize(b, (w, h))
 
-def natural_key(p: str):
-    stem = Path(p).stem
-    from datetime import datetime
+def parse_ts_from_stem(stem: str):
+    # Try explicit formats
     for fmt in TS_FORMATS:
-        try: return datetime.strptime(stem, fmt)
-        except: pass
-    try: return Path(p).stat().st_mtime
-    except: return stem
+        try:
+            return datetime.strptime(stem, fmt).timestamp()
+        except Exception:
+            pass
+    # Try compact numeric yyyymmddhhmmss from any digits in the stem
+    digits = re.sub(r"\D", "", stem)
+    for cand_len in (14, 12, 8):  # 14: yyyymmddhhmmss, 12: yyyymmddhhmm, 8: yyyymmdd
+        if len(digits) >= cand_len:
+            s = digits[:cand_len]
+            try:
+                if cand_len == 14:
+                    return datetime.strptime(s, "%Y%m%d%H%M%S").timestamp()
+                if cand_len == 12:
+                    return datetime.strptime(s, "%Y%m%d%H%M").timestamp()
+                if cand_len == 8:
+                    return datetime.strptime(s, "%Y%m%d").timestamp()
+            except Exception:
+                continue
+    return None
+
+def sort_key(path_str: str):
+    p = Path(path_str)
+    stem = p.stem
+    ts = parse_ts_from_stem(stem)
+    if ts is None:
+        # fallback to file mtime (we set this to Drive createdDate in drive_sync)
+        try:
+            ts = p.stat().st_mtime
+        except Exception:
+            ts = 0.0
+    # tie-breaker with name to keep ordering stable
+    return (ts, stem)
 
 def ssim_diff(a, b):
     a, b = resize_to_min(a, b)
@@ -69,14 +105,16 @@ def main():
 
     for folder in folders:
         page = folder.name
-        imgs = []
+        files = []
         for ext in ("*.png","*.jpg","*.jpeg","*.webp"):
-            imgs += glob.glob(str(folder / ext))
-        imgs = sorted(imgs, key=natural_key)
-        if len(imgs) < 2:
+            files += glob.glob(str(folder / ext))
+        if len(files) < 2:
             continue
 
-        a_path, b_path = imgs[-2], imgs[-1]
+        files = sorted(files, key=sort_key)  # ascending by true timestamp
+        # pick the most recent two (last two in ascending order)
+        a_path, b_path = files[-2], files[-1]
+
         img_a, img_b = cv2.imread(a_path), cv2.imread(b_path)
         if img_a is None or img_b is None:
             continue
@@ -86,7 +124,6 @@ def main():
         changed = (ssim_score < SSIM_THRESHOLD) or (pdelta > PHASH_THRESHOLD)
         zone = guess_zone(norm) if changed else ""
 
-        # Per-page out dir
         page_out = OUTDIR / page
         ensure_dir(page_out)
 
@@ -94,7 +131,7 @@ def main():
         heat_path = page_out / f"diff_{Path(a_path).name}_vs_{Path(b_path).name}.png"
         cv2.imwrite(str(heat_path), heat)
 
-        # Copy the two source screenshots into the run folder (for reviewers)
+        # Copy the two source screenshots alongside the heatmap for reviewers
         shutil.copy2(a_path, page_out / Path(a_path).name)
         shutil.copy2(b_path, page_out / Path(b_path).name)
 
@@ -117,7 +154,6 @@ def main():
     csv_path = OUTDIR / "summary.csv"
     df.to_csv(csv_path, index=False)
 
-    # Simple HTML
     html = [
         "<html><head><meta charset='utf-8'><title>UI Diff Report</title>",
         "<style>body{font-family:system-ui,Arial} table{border-collapse:collapse} td,th{border:1px solid #ddd;padding:6px} .chg{background:#ffecec}</style>",
