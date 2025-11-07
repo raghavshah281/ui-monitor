@@ -2,7 +2,7 @@ name: UI Monitor (daily)
 
 on:
   schedule:
-    - cron: "0 7 * * *"   # ~10:30 IST daily (05:00 UTC)
+    - cron: "0 7 * * *"   # 07:00 UTC (~12:30 IST). Change if needed.
   workflow_dispatch:
 
 jobs:
@@ -87,6 +87,7 @@ jobs:
           import os, pandas as pd, requests
           from pathlib import Path
 
+          # --- Build the message (always a plain string, trimmed safely) ---
           runs = sorted([p for p in Path("out/diffs").glob("run_*") if p.is_dir()])
           latest = runs[-1]
           csv_path = latest / "summary.csv"
@@ -100,23 +101,50 @@ jobs:
             lines.append("Changes detected:")
             for _, r in changed.iterrows():
               zone = f" Likely area: {r['likely_zone']}." if isinstance(r['likely_zone'], str) and r['likely_zone'] else ""
-              lines.append(f"• UI/UX of {r['page']} has been changed compared to the previous capture.{zone}")
+              # keep per-line reasonably short
+              lines.append(f"• UI/UX of {str(r['page'])} has been changed compared to the previous capture.{zone}")
           else:
             lines.append("No UI/UX changes detected across monitored pages.")
 
           link = "${{ steps.upload.outputs.link }}"
           lines.append("\nFull report, heatmaps, and both source images in:")
-          lines.append(link)
+          lines.append(str(link))
 
           message = "\n".join(lines)
+          # Hard cap to avoid ClickUp 40k char limit; keep a bit of headroom
+          if len(message) > 38000:
+            message = message[:37950] + "\n…(truncated)"
 
-          url = f"https://api.clickup-stg.com/api/v3/workspaces/{os.environ['CLICKUP_WORKSPACE_ID']}/chat/channels/{os.environ['CLICKUP_CHANNEL_ID']}/messages"
-          headers = {"Authorization": os.environ["CLICKUP_TOKEN"], "Content-Type": "application/json"}
-          r = requests.post(url, headers=headers, json={"text": message}, timeout=30)
-          print("ClickUp response:", r.status_code, r.text[:400])
+          # --- Post to ClickUp Chat channel (try both payload shapes) ---
+          token = os.environ["CLICKUP_TOKEN"]
+          ws_id = os.environ["CLICKUP_WORKSPACE_ID"]
+          ch_id = os.environ["CLICKUP_CHANNEL_ID"]
+
+          base_url = f"https://api.clickup-stg.com/api/v3/workspaces/{ws_id}/chat/channels/{ch_id}/messages"
+          headers = {"Authorization": token, "Content-Type": "application/json"}
+
+          def try_post(payload):
+            try:
+              r = requests.post(base_url, headers=headers, json=payload, timeout=30)
+              return r.status_code, r.text
+            except Exception as e:
+              return 599, str(e)
+
+          # 1) Standard chat payload
+          code, body = try_post({"text": message})
+          print("ClickUp attempt#1 (text) ->", code)
+          if code >= 300:
+            print("Response:", body[:400])
+
+            # 2) Alternate payload some orgs expect
+            code2, body2 = try_post({"content": message})
+            print("ClickUp attempt#2 (content) ->", code2)
+            if code2 >= 300:
+              print("Response:", body2[:400])
+              raise SystemExit("Failed to send to ClickUp channel (both payload shapes rejected).")
           PY
 
-      # 5) Keep a copy of the run as an artifact (handy for debugging)
+      # 5) Keep a copy of the run as a GitHub artifact (handy for debugging)
       - name: Upload run as GitHub artifact (optional)
         uses: actions/upload-artifact@v4
         with:
